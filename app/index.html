@@ -296,6 +296,10 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
 .p-body.resting .p-info { flex: 1 1 76%; }
 .p-body.resting .timer { font-size: clamp(52px, 15vw, 88px); }
 
+.seg.len button { min-height: 52px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; line-height: 1.15; }
+.seg.len button b { font-size: 14px; }
+.seg.len button span { font-size: 11.5px; font-weight: 600; color: var(--fg-3); }
+
 </style>
 </head>
 <body>
@@ -815,7 +819,14 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
   };
 
   // ------------------------------------------------------------------ Generator
-  const COOLDOWN = 120;
+  const COOLDOWN = 120, WARMUP = 180;
+  /** Session length = minutes of main work (15 = Express: the original 20 minutes in total). */
+  const SessionLength = {
+    EXPRESS: 15, options: [15, 20, 25],
+    normalize: (m) => (m <= 15 ? 15 : m >= 25 ? 25 : 20),
+    totalMinutes(m) { const [w, mm, c] = Gen.budget(m); return Math.trunc((w + mm + c) / 60); },
+    defaultFor: (goal) => (goal === 'MUSCLE' || goal === 'CONDITIONING' || goal === 'FAT_LOSS' ? 25 : 20),
+  };
   const SLOT_PATTERNS = {
     HINGE: (e) => e.pattern === 'HINGE',
     SQUAT: (e) => e.pattern === 'SQUAT' || e.pattern === 'LUNGE',
@@ -831,9 +842,15 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
   const FORMAT_NAME = { WARMUP: 'Warm-up', COOLDOWN: 'Cool-down', STRENGTH: 'Strength', EMOM: 'EMOM', AMRAP: 'AMRAP', INTERVALS: 'Intervals', LADDER: 'Ladder', COMPLEX: 'Complex', TABATA: 'Tabata', CHIPPER: 'Chipper' };
 
   const Gen = {
-    COOLDOWN,
+    COOLDOWN, WARMUP,
     formatName: (f) => FORMAT_NAME[f],
-    budget: (m) => (m >= 25 ? [240, 25 * 60 - 240 - COOLDOWN, COOLDOWN] : [180, 20 * 60 - 180 - COOLDOWN, COOLDOWN]),
+    budget(m) {
+      const n = SessionLength.normalize(m);
+      return n === 15 ? [WARMUP, 20 * 60 - WARMUP - COOLDOWN, COOLDOWN] : n === 20 ? [WARMUP, 20 * 60, COOLDOWN] : [WARMUP, 25 * 60, COOLDOWN];
+    },
+    rampable(ex, state) {
+      return needsBells(ex) > 0 && ex.loadClass !== 'BODYWEIGHT' && ex.skill !== 'GETUP' && ex.id !== 'turkish_getup' && WE.recommend(ex, state, 'WARMUP').kg != null;
+    },
     learnedAll(state) {
       const out = (state.learned || []).concat(Safety.autoLearned(state.profile.experience));
       for (const id of (state.practiceTracks || []).concat(state.testOut || [])) {
@@ -1053,7 +1070,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       });
       return { title, format: fmt, description: desc, segments: segs };
     },
-    warmup(state, seconds, rng, used, fixed = []) {
+    warmup(state, seconds, rng, used, fixed = [], ramp = null, focus = 'FULL') {
       const p = state.profile, learned = Gen.learnedAll(state);
       const ok = LIB.filter((e) => has(e.roles, 'WARMUP') && Safety.allowed(e, p, learned) && Safety.equipmentOk(e, state.equipment) && (e.loadClass === 'BODYWEIGHT' || WE.recommend(e, state, 'WARMUP').feasible));
       const mine = fixed.map((id) => ok.find((e) => e.id === id)).filter(Boolean);
@@ -1064,18 +1081,23 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
         ['arm_circles', 'halo', 'pullover', 'thread_the_needle', 'cat_cow'],
         ['march', 'worlds_greatest_stretch', 'inchworm', 'hip_circles', 'around_the_body'],
       ];
-      const chosen = groups.map((g) => rnd.randomOrNull(ok.filter((e) => g.includes(e.id) && !used.has(e.id)), rng)).filter(Boolean);
-      while (chosen.length < 4) {
+      const order = focus === 'LOWER' ? [0, 1, 3, 2] : focus === 'UPPER_CORE' ? [2, 3, 0, 1] : [0, 1, 2, 3];
+      const practice = ramp && Gen.rampable(ramp, state) ? ramp : null;
+      const slots = practice ? 3 : 4;
+      const chosen = order.slice(0, slots).map((gi) => rnd.randomOrNull(ok.filter((e) => groups[gi].includes(e.id) && !used.has(e.id)), rng)).filter(Boolean);
+      while (chosen.length < slots) {
         const extra = rnd.randomOrNull(ok.filter((e) => !chosen.includes(e) && !used.has(e.id)), rng) || rnd.randomOrNull(ok.filter((e) => !chosen.includes(e)), rng);
         if (!extra) break;
         chosen.push(extra);
       }
+      if (practice && !chosen.includes(practice)) chosen.push(practice);
       if (!chosen.length) chosen.push(get('march'));
       const each = trunc(seconds / chosen.length);
       const segs = chosen.map((ex, i) => {
         const s = i === chosen.length - 1 ? seconds - each * (chosen.length - 1) : each;
         const kg = ex.loadClass === 'BODYWEIGHT' ? null : WE.recommend(ex, state, 'WARMUP').kg;
-        return { kind: 'WORK', seconds: s, items: [{ exId: ex.id, reps: null, seconds: s, kg, perSide: false, note: ex.dose.perSide ? 'Switch sides halfway.' : 'Easy pace, full range.' }], label: 'Warm-up ' + (i + 1) + ' of ' + chosen.length, cue: ex.cues[0] };
+        const note = ex === practice ? 'Practice set: light bell, smooth and perfect reps. Your first lift today.' : ex.dose.perSide ? 'Switch sides halfway.' : 'Easy pace, full range.';
+        return { kind: 'WORK', seconds: s, items: [{ exId: ex.id, reps: null, seconds: s, kg, perSide: false, note }], label: ex === practice ? 'Warm-up ' + (i + 1) + ' of ' + chosen.length + ' - practice set' : 'Warm-up ' + (i + 1) + ' of ' + chosen.length, cue: ex.cues[0] };
       });
       return { title: 'Warm-up', format: 'WARMUP', description: 'Raise your temperature and rehearse today\'s patterns.', segments: segs };
     },
@@ -1102,7 +1124,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       opt = Object.assign({ minutes: 20, focus: 'AUTO', intensity: null, format: null, preferred: [], presetId: null, seed: Gen.newSeed(), shuffle: false, custom: null }, opt);
       const rng = new XorWow(opt.seed);
       const p = state.profile;
-      const minutes = opt.minutes >= 25 ? 25 : 20;
+      const minutes = SessionLength.normalize(opt.minutes);
       const [warmSec, mainSec, coolSec] = Gen.budget(minutes);
       const program = opt.custom ? null : Programs.weekPlan(state.enrollment, today);
       const week = program ? program[1] : null;
@@ -1204,7 +1226,6 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
 
       const reasons = new Map();
       const blocks = [];
-      blocks.push(Gen.warmup(state, warmSec, rng, used, custom ? (custom.warm || []) : []));
       specs.forEach((sp, i) => {
         const fmt = sp.fmt;
         const wanted = Gen.slots(fmt, focus, goal);
@@ -1214,19 +1235,21 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       });
       for (const [id, note] of swapNotes) reasons.set(id, note + (reasons.has(id) ? ' ' + reasons.get(id) : ''));
 
-      const builtMain = sum(blocks.slice(1), blockSeconds);
+      const builtMain = sum(blocks, blockSeconds);
       if (builtMain < mainSec) {
         const gap = mainSec - builtMain;
         const mob = LIB.filter((e) => (has(e.roles, 'WARMUP') || has(e.roles, 'COOLDOWN')) && Safety.allowed(e, p, learned) && Safety.equipmentOk(e, state.equipment));
         blocks.push(Gen.fillerBlock(gap, rnd.shuffled(mob, rng).slice(0, 3)));
       }
+      const firstId = blocks.length ? blockExIds(blocks[0])[0] : null;
+      blocks.unshift(Gen.warmup(state, warmSec, rng, used, custom ? (custom.warm || []) : [], firstId ? find(firstId) : null, focus));
       blocks.push(Gen.cooldown(state, coolSec, focus, rng, custom ? (custom.cool || []) : []));
 
       const ids = distinct([].concat(...blocks.filter((b) => b.format !== 'WARMUP' && b.format !== 'COOLDOWN').map(blockExIds)));
       const focusName = focus === 'LOWER' ? 'Lower Body' : focus === 'UPPER_CORE' ? 'Upper & Core' : focus === 'CONDITIONING' ? 'Conditioning' : 'Full Body';
       const preset = D.presets.find((x) => x.id === opt.presetId);
       const title = (custom && custom.name) || (preset && preset.name) || (day && day.name) || (focusName + ' ' + FORMAT_NAME[shape[0]]);
-      const subtitle = minutes + ' min - ' + shape.map((f) => FORMAT_NAME[f]).join(' + ') + ' - ' + ids.length + ' exercises' + (deload ? ' - deload' : '');
+      const subtitle = trunc((warmSec + mainSec + coolSec) / 60) + ' min - ' + shape.map((f) => FORMAT_NAME[f]).join(' + ') + ' - ' + ids.length + ' exercises' + (deload ? ' - deload' : '');
       const seedLow = Number(BigInt.asIntN(64, BigInt(opt.seed)) & 0xffffffn);
       const plan = {
         id: 'p-' + today + '-' + seedLow, epochDay: today, minutes, title, subtitle, goal, focus, intensity, deload, blocks,
@@ -1234,7 +1257,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
         programWeek: state.enrollment ? Programs.weekNumber(state.enrollment, today) : null, presetId: opt.presetId,
         programDay: dayIndex != null ? dayIndex + 1 : null, customId: custom ? custom.id : null,
       };
-      if (planTotal(plan) !== minutes * 60) throw new Error('Time budget mismatch: ' + planTotal(plan) + ' vs ' + minutes * 60);
+      if (planTotal(plan) !== warmSec + mainSec + coolSec) throw new Error('Time budget mismatch: ' + planTotal(plan) + ' vs ' + (warmSec + mainSec + coolSec));
       return plan;
     },
 
@@ -1348,7 +1371,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       }
       const main = { title: r.name, format: fmt, description: r.description, segments: segs };
       const used = new Set(resolved.map(([, ex]) => ex.id));
-      const warm = Gen.warmup(state, 180, rng, used);
+      const warm = Gen.warmup(state, WARMUP, rng, used, [], resolved[0][1], r.focus);
       const cool = Gen.cooldown(state, COOLDOWN, r.focus, rng);
       const blocks = [warm, main, cool];
       const total = sum(blocks, blockSeconds);
@@ -1364,7 +1387,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
   };
 
   const KW = {
-    init, find, get, needsBells, isDouble, XorWow, rnd, UnitFmt, Profile, Equip, Safety, WE, Coach, Effort, Insights, Programs, Gen, Recipes,
+    init, find, get, needsBells, SessionLength, isDouble, XorWow, rnd, UnitFmt, Profile, Equip, Safety, WE, Coach, Effort, Insights, Programs, Gen, Recipes,
     STANDARD_KG, STANDARD_LB, LB_PER_KG, planTotal, segmentsOf, mainIds, allIds, blockSeconds, blockExIds, f32,
     get LIB() { return LIB; }, get D() { return D; },
   };
@@ -2019,6 +2042,9 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
   const doneToday = () => S.sessions.some((s) => s.epochDay === today());
   const planningState = () => S;
   const doseText = (item, ex) => item.reps != null ? item.reps + ' reps' + (item.perSide ? ' each side' : '') : item.seconds != null ? item.seconds + ' s' : (item.note || '');
+  const LENGTHS = [[15, 'Express', '20 min in total'], [20, '20 min work', 'about 25 min'], [25, '25 min work', 'about 30 min']];
+  const lengthName = (m) => { const l = LENGTHS.find((x) => x[0] === KW.SessionLength.normalize(m)); return l[1] + (l[0] === 15 ? ' (20 min)' : ''); };
+  const lengthSeg = (act, val) => '<div class="seg len" role="group">' + LENGTHS.map(([v, l, s]) => '<button data-act="' + act + '" data-v="' + v + '" aria-pressed="' + (KW.SessionLength.normalize(val) === v) + '"><b>' + l + '</b><span>' + s + '</span></button>').join('') + '</div>';
   const FOCUS = [['AUTO', 'Auto'], ['FULL', 'Full body'], ['LOWER', 'Lower'], ['UPPER_CORE', 'Upper & core'], ['CONDITIONING', 'Conditioning']];
   const GOALS = [['FAT_LOSS', 'Lose fat'], ['STRENGTH', 'Get stronger'], ['MUSCLE', 'Build muscle and shape'], ['CONDITIONING', 'Conditioning and endurance'], ['MOBILITY', 'Mobility and joint health'], ['SPORT', 'Support my sport']];
   const goalName = (g) => (GOALS.find((x) => x[0] === g) || [0, g])[1];
@@ -2323,7 +2349,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
         const comp = r.skipped ? 0 : r.completion >= KW.f32(0.95) ? 1 : r.completion >= KW.f32(0.7) ? 0.85 : 0.5;
         fb[r.exId] = { rpe: u.rpe[r.exId] != null ? u.rpe[r.exId] : r.tooHard ? 9 : 7, completion: comp };
       }
-      ui.summary = { plan: u.plan, sum, prs, elapsedSec: Math.round(u.elapsedMs / 1000), startedAt: u.startedAt, completed: u.segDone.every((x) => x >= 0.999), fb, sessionRpe: 7 };
+      ui.summary = { plan: u.plan, sum, prs, elapsedSec: Math.round(u.elapsedMs / 1000), startedAt: u.startedAt, completed: KW.segmentsOf(u.plan).every((s, i) => u.segDone[i] >= 0.999 || u.plan.blocks.some((b) => b.format === 'COOLDOWN' && b.segments.includes(s))), fb, sessionRpe: 7 };
       ui.player = null;
       S.active = null; Store.save('live', 0);
       render(); window.scrollTo(0, 0);
@@ -2573,7 +2599,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
     if (plan.intensity !== 'NORMAL') tagLine.push('<span class="tag">' + (plan.intensity === 'EASY' ? 'Easy day' : 'Hard day') + '</span>');
     const subtitle = plan.subtitle.split(' - ').slice(1).join(' · ');
     let h = '<section class="card stack" aria-labelledby="plan-t"><div class="plan-head stack-s">' + (tagLine.length ? '<div class="row wrap">' + tagLine.join('') + '</div>' : '') +
-      '<h2 id="plan-t">' + esc(plan.title) + '</h2><div class="meta"><span><b class="num">' + Math.round(total / 60) + '</b> min</span><span>' + esc(subtitle) + '</span></div></div>';
+      '<h2 id="plan-t">' + esc(plan.title) + '</h2><div class="meta"><span><b class="num">' + Math.round(total / 60) + '</b> min</span>' + (plan.presetId && plan.presetId.startsWith('recipe:') ? '' : '<span>' + esc(lengthName(plan.minutes)) + '</span>') + '<span>' + esc(subtitle) + '</span></div></div>';
     h += '<div class="timeline" aria-hidden="true">' + plan.blocks.map((b) => '<i style="flex:' + KW.blockSeconds(b) + ';background:' + blockColor(b) + ';opacity:' + (b.format === 'WARMUP' || b.format === 'COOLDOWN' ? .55 : 1) + '"></i>').join('') + '</div>';
     for (const b of plan.blocks) {
       const ids = KW.blockExIds(b);
@@ -2604,7 +2630,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
     const focus = planOpt.focus;
     const inten = planOpt.intensity || 'AUTO';
     return '<section class="stack"><div class="section-title"><h2>Change today</h2></div>' +
-      '<div class="stack-s"><span class="label">Length</span>' + seg('opt-min', mins, [[20, '20 min'], [25, '25 min']]) + '</div>' +
+      '<div class="stack-s"><span class="label">Length</span>' + lengthSeg('opt-min', mins) + '<span class="tiny faint">Warm-up (3 min) and cool-down (2 min) come on top of the work time. Express is for busy days.</span></div>' +
       '<div class="stack-s"><span class="label">Focus</span><div class="chips">' + FOCUS.map(([v, l]) => chip('opt-focus', v, l, focus === v)).join('') + '</div></div>' +
       '<div class="stack-s"><span class="label">Intensity</span>' + seg('opt-int', inten, [['AUTO', 'Auto'], ['EASY', 'Easy'], ['NORMAL', 'Normal'], ['HARD', 'Hard']]) + '</div>' +
       '<div class="row"><button class="btn primary grow" data-act="rebuild">Build this session</button><button class="btn outline" data-act="shuffle" aria-label="Different moves">' + I.shuffle + 'Shuffle</button></div></section>';
@@ -2686,7 +2712,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
     const learned = KW.Gen.learnedAll(S);
     const auto = KW.Safety.autoLearned(p.experience);
     let h = '<main class="page"><header class="topbar"><h1>Settings</h1></header>';
-    h += '<section class="card stack"><div class="row" style="justify-content:space-between"><div class="stack-s"><span class="eyebrow">You</span><b style="font-size:17px">' + esc(p.name || 'Your profile') + '</b><span class="small muted">' + esc(EXPERIENCE.find((x) => x[0] === p.experience)[1]) + ' · ' + esc(goalName(p.primaryGoal)) + ' · ' + p.daysPerWeek + ' days, ' + p.preferredMinutes + ' min</span></div><button class="btn outline small" data-act="edit-profile">Edit</button></div>' +
+    h += '<section class="card stack"><div class="row" style="justify-content:space-between"><div class="stack-s"><span class="eyebrow">You</span><b style="font-size:17px">' + esc(p.name || 'Your profile') + '</b><span class="small muted">' + esc(EXPERIENCE.find((x) => x[0] === p.experience)[1]) + ' · ' + esc(goalName(p.primaryGoal)) + ' · ' + p.daysPerWeek + ' days, ' + esc(lengthName(p.preferredMinutes)) + '</span></div><button class="btn outline small" data-act="edit-profile">Edit</button></div>' +
       '<div class="divider"></div><div class="row" style="justify-content:space-between"><div class="stack-s"><span class="eyebrow">Bells</span><span class="small">' + (bells.length ? esc(bells.map((k) => W(k) + (KW.Equip.count(eq, k) > 1 ? ' ×' + KW.Equip.count(eq, k) : '')).join(', ')) : 'No bells yet') + '</span></div><button class="btn outline small" data-act="edit-bells">Edit</button></div></section>';
     h += '<section class="stack"><div class="section-title"><h2>Coaching</h2></div><div class="card" style="padding-block:4px">' +
       sw('set-voice', 'Voice coach', s.voice, 'Announces each exercise, rest and countdown') +
@@ -2783,6 +2809,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
     const isMain = focusId && KW.mainIds(plan).includes(focusId);
     const extras = [];
     if (sg.kind === 'REST' || sg.kind === 'TRANSITION') extras.push('<button class="btn ghost small" data-act="p-extend">+15 s</button>');
+    if (block && block.format === 'COOLDOWN') extras.push('<button class="btn outline small" data-act="p-skipcool">Skip cool-down</button>');
     if (isMain) { extras.push('<button class="btn ghost small" data-act="p-swap" data-v="' + focusId + '">' + I.swap + 'Swap</button>'); extras.push('<button class="btn ghost small" data-act="p-easier" data-v="' + focusId + '">' + I.down + 'Too hard</button>'); }
     const html = '<div class="player" role="region" aria-label="Workout"><div class="player-in">' +
       '<div class="p-head"><button class="icon-btn" data-act="p-end" aria-label="End session">' + I.close + '</button><div class="grow"><b style="color:' + color + '">' + esc(block ? KW.Gen.formatName(block.format) : '') + '</b><span class="small muted num" id="p-left">' + fmtTime(left / 1000) + ' left</span></div>' +
@@ -2926,7 +2953,8 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
   }
   function scheduleFields(d) {
     return '<div class="field"><span class="label">Training days per week</span>' + seg('f-days', d.profile.daysPerWeek, [[2, '2'], [3, '3'], [4, '4'], [5, '5'], [6, '6']]) + '</div>' +
-      '<div class="field"><span class="label">Session length</span>' + seg('f-mins', d.profile.preferredMinutes, [[20, '20 minutes'], [25, '25 minutes']]) + '</div>';
+      '<div class="field"><span class="label">Session length</span>' + lengthSeg('f-mins', d.profile.preferredMinutes) +
+      '<p class="small muted">The time is main work; a 3-minute warm-up and a 2-minute cool-down come on top. More work each week means faster progress, especially for muscle and conditioning. Express keeps the whole session to 20 minutes for busy days.</p></div>';
   }
   function limitFields(d) {
     const p = d.profile;
@@ -2970,7 +2998,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
     else if (step === 'experience') body = '<h2 style="font-size:26px">Your experience</h2><div class="stack-s">' + EXPERIENCE.map(([v, t, s]) => '<button class="opt" data-act="f-exp" data-v="' + v + '" aria-pressed="' + (d.profile.experience === v) + '"><span class="radio"></span><span><b>' + esc(t) + '</b><span class="small muted">' + esc(s) + '</span></span></button>').join('') + '</div>';
     else if (step === 'goals') body = '<h2 style="font-size:26px">Your goals</h2><div class="field"><span class="label">Main goal</span><div class="stack-s">' + GOALS.map(([v, l]) => '<button class="opt" data-act="f-goal" data-v="' + v + '" aria-pressed="' + (d.profile.primaryGoal === v) + '"><span class="radio"></span><b>' + esc(l) + '</b></button>').join('') + '</div></div>' +
       '<div class="field"><span class="label">Also want (optional)</span><div class="chips">' + GOALS.filter((g) => g[0] !== d.profile.primaryGoal).map(([v, l]) => chip('f-goal2', v, l, d.profile.secondaryGoal === v)).join('') + '</div></div>';
-    else if (step === 'week') body = '<h2 style="font-size:26px">Your week</h2><p class="muted">Every session fits the time exactly: warm-up, main work and cool-down included.</p>' + scheduleFields(d);
+    else if (step === 'week') body = '<h2 style="font-size:26px">Your week</h2><p class="muted">Pick how long you want to train. A 3-minute warm-up and a 2-minute cool-down are added on top, and every session fits its time exactly.</p>' + scheduleFields(d);
     else if (step === 'safety') body = '<h2 style="font-size:26px">Keep it safe</h2>' + limitFields(d);
     else if (step === 'bells') {
       body = '<h2 style="font-size:26px">Your bells</h2>' + bellFields(d);
@@ -3136,10 +3164,10 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       case 'f-units': d.units = v; rerenderForm(); break;
       case 'f-sex': d.profile.sex = v; rerenderForm(); break;
       case 'f-exp': d.profile.experience = v; rerenderForm(); break;
-      case 'f-goal': d.profile.primaryGoal = v; if (d.profile.secondaryGoal === v) d.profile.secondaryGoal = null; rerenderForm(); break;
+      case 'f-goal': d.profile.primaryGoal = v; if (d.profile.secondaryGoal === v) d.profile.secondaryGoal = null; if (!d.lenTouched && !S.onboarded) d.profile.preferredMinutes = KW.SessionLength.defaultFor(v); rerenderForm(); break;
       case 'f-goal2': d.profile.secondaryGoal = d.profile.secondaryGoal === v ? null : v; rerenderForm(); break;
       case 'f-days': d.profile.daysPerWeek = +v; rerenderForm(); break;
-      case 'f-mins': d.profile.preferredMinutes = +v; rerenderForm(); break;
+      case 'f-mins': d.profile.preferredMinutes = +v; d.lenTouched = true; rerenderForm(); break;
       case 'f-lim': { const l = d.profile.limitations; d.profile.limitations = l.includes(v) ? l.filter((x) => x !== v) : l.concat([v]); rerenderForm(); break; }
       case 'f-parq': { const i = +arg; const y = d.profile.parqYes.filter((x) => x !== i); if (v === 'yes') y.push(i); d.profile.parqYes = y.sort(); rerenderForm(); break; }
       case 'f-clear': d.profile.medicalClearance = !d.profile.medicalClearance; rerenderForm(); break;
@@ -3174,6 +3202,7 @@ ol.steps li::marker { font-weight: 800; color: var(--fg-3); }
       case 'p-extend': Player.extend(15); break;
       case 'p-round': Player.addRound(+v); break;
       case 'p-voice': S.settings.voice = !S.settings.voice; if (!S.settings.voice && window.speechSynthesis) speechSynthesis.cancel(); Store.save('core'); renderPlayerView(true); break;
+      case 'p-skipcool': Actions.endEarly(); break;
       case 'p-end': confirmDialog('End the session now?', 'Everything you\'ve done so far is kept for rating.', 'End session', () => Actions.endEarly()); break;
       case 'p-easier': { const m = Actions.easier(v); renderPlayerView(true); toast(m); break; }
       case 'p-swap': { const was = Player.u.running; Player.pause(); ui.sheet = { type: 'swap', id: v, inSession: true, wasRunning: was }; renderSheet(); break; }

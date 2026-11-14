@@ -6519,6 +6519,71 @@ three/build/three.module.js:
     return out;
   }
 
+
+  // ================================================================== accounts: Supabase email-code sign-in + cloud copy
+  const Cloud = {
+    URL: 'https://ilmpvihhrmjnisejhazl.supabase.co', KEY: 'sb_publishable_4Ih_5h1uMpaAUuEObqpQeA_oiNQ0C-r', K: 'kettlewise.auth.v1', sess: null,
+    read() { try { const j = localStorage.getItem(Cloud.K); Cloud.sess = j ? JSON.parse(j) : null; } catch (e) { Cloud.sess = null; } return Cloud.sess; },
+    write(x) { Cloud.sess = x; try { if (x) localStorage.setItem(Cloud.K, JSON.stringify(x)); else localStorage.removeItem(Cloud.K); } catch (e) { /* blocked */ } },
+    sessFrom(j) { return { access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at || Math.floor(Date.now() / 1000) + (j.expires_in || 3600), user: { id: j.user.id, email: j.user.email } }; },
+    async raw(path, o, token) {
+      o = o || {};
+      const h = Object.assign({ apikey: Cloud.KEY, Authorization: 'Bearer ' + (token || Cloud.KEY), 'Content-Type': 'application/json' }, o.headers || {});
+      try { return await fetch(Cloud.URL + path, { method: o.method || 'GET', headers: h, body: o.body == null ? undefined : JSON.stringify(o.body) }); }
+      catch (e) { throw { code: 'unavailable' }; }
+    },
+    async refresh() {
+      const s0 = Cloud.sess; if (!s0) throw { code: 'revoked' };
+      const r = await Cloud.raw('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: s0.refresh_token } });
+      if (r.status >= 500) throw { code: 'unavailable' };
+      if (!r.ok) { Cloud.write(null); throw { code: 'revoked' }; }
+      Cloud.write(Cloud.sessFrom(await r.json()));
+    },
+    async token() { if (!Cloud.sess) throw { code: 'revoked' }; if (Cloud.sess.expires_at - 60 < Date.now() / 1000) await Cloud.refresh(); return Cloud.sess.access_token; },
+    async rest(path, o) {
+      let r = await Cloud.raw('/rest/v1' + path, o, await Cloud.token());
+      if (r.status === 401) { await Cloud.refresh(); r = await Cloud.raw('/rest/v1' + path, o, Cloud.sess.access_token); }
+      if (!r.ok) { let m = ''; try { m = (await r.json()).message || ''; } catch (e) { /* none */ } throw { code: r.status >= 500 ? 'unavailable' : 'error', status: r.status, message: m }; }
+      const txt = await r.text(); if (!txt) return null;
+      try { return JSON.parse(txt); } catch (e) { return null; }
+    },
+    async sendCode(email) {
+      const r = await Cloud.raw('/auth/v1/otp', { method: 'POST', body: { email, create_user: true } });
+      if (r.ok) return;
+      if (r.status === 429) throw new Error('Too many codes requested. Wait a few minutes and try again.');
+      let m = ''; try { const j = await r.json(); m = j.msg || j.message || j.error_description || ''; } catch (e) { /* none */ }
+      throw new Error(r.status >= 500 ? 'The sign-in service is not responding. Try again shortly.' : (m || 'Could not send the code.'));
+    },
+    async verify(email, token) {
+      const r = await Cloud.raw('/auth/v1/verify', { method: 'POST', body: { type: 'email', email, token } });
+      if (!r.ok) throw new Error(r.status >= 500 ? 'The sign-in service is not responding. Try again shortly.' : 'That code is wrong or has expired. Request a new one.');
+      Cloud.write(Cloud.sessFrom(await r.json()));
+    },
+    async signOut() { try { if (Cloud.sess) await Cloud.raw('/auth/v1/logout', { method: 'POST' }, Cloud.sess.access_token); } catch (e) { /* offline: still sign out here */ } Cloud.write(null); },
+    docRef(name) {
+      const enc = encodeURIComponent(name);
+      return {
+        async get() { const rows = await Cloud.rest('/kw_docs?select=data&name=eq.' + enc + '&limit=1'); return { exists: rows.length > 0, data: () => rows[0].data }; },
+        async set(obj) { await Cloud.rest('/kw_docs?on_conflict=user_id,name', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: [{ user_id: Cloud.sess.user.id, name, data: obj, updated_at: new Date().toISOString() }] }); },
+        async delete() { await Cloud.rest('/kw_docs?name=eq.' + enc, { method: 'DELETE' }); },
+        collection() {
+          return {
+            limit(n) { return { async get() { const rows = await Cloud.rest('/kw_docs?select=name,data&name=like.session:*&limit=' + n); return { docs: rows.map((r) => ({ id: r.name.slice(8), data: () => r.data })) }; } }; },
+            doc(id) { return Cloud.docRef('session:' + id); },
+          };
+        },
+      };
+    },
+    db() { return { doc: (path) => Cloud.docRef(path.split('/').pop()) }; },
+  };
+  function mergeStates(l, r) {
+    if (!r) return l; if (!l || !l.onboarded) return r;
+    const base = (r.updatedAt || 0) >= (l.updatedAt || 0) ? r : l, other = base === r ? l : r;
+    const out = clone(base), seen = new Set((out.sessions || []).map((x) => x.id));
+    out.sessions = (out.sessions || []).concat((other.sessions || []).filter((x) => !seen.has(x.id)));
+    return out;
+  }
+
   // ================================================================== storage: claude db (per person, private) + local cache
   const Store = {
     db: null, uid: null, base: null, timers: {}, busy: {}, again: {},
@@ -6530,7 +6595,11 @@ three/build/three.module.js:
       return rest;
     },
     async connect() {
-      if (!window.claude || !window.claude.use) return false;
+      if (!window.claude || !window.claude.use) {
+        const cs = Cloud.read();
+        if (cs && cs.user) { Store.db = Cloud.db(); Store.uid = cs.user.id; Store.base = 'data/users/' + cs.user.id; return 'cloud'; }
+        return false;
+      }
       try {
         const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
         if (!db || !user) return false;
@@ -6573,8 +6642,9 @@ three/build/three.module.js:
         ui.storageNote = null;
       } catch (e) {
         if (e && e.code === 'quota_exceeded') ui.storageNote = 'Your training store is full. Export a backup in Settings.';
-        else if (e && (e.code === 'revoked' || e.code === 'not_granted')) { Store.db = null; ui.storage = 'local'; }
+        else if (e && (e.code === 'revoked' || e.code === 'not_granted')) { Store.db = null; ui.storage = 'local'; if (e.code === 'revoked') ui.storageNote = 'You were signed out. Your training is still on this device; sign in again from Settings to keep syncing.'; }
         else if (e && e.code === 'unavailable') setTimeout(() => Store.save(which, 0), 1500 + Math.random() * 1000);
+        else if (e && e.code === 'error') ui.storageNote = 'Could not save to your account (' + (e.message || e.status) + '). Your training is safe on this device.';
       } finally {
         Store.busy[which] = false;
         if (Store.again[which]) { Store.again[which] = false; Store.flush(which); }
@@ -7333,7 +7403,7 @@ three/build/three.module.js:
     }
     if (m === 'BACKUP') {
       const d = KW.Backup.daysSince(S, t);
-      return '<section class="card flat stack"><div class="stack-s"><span class="eyebrow">Backup</span><p class="small">' + (ui.storage === 'db' ? 'Your training is saved to your Claude account. A backup file is a second copy you control.' : 'Your training history lives only on this device. A backup file means a lost or reset phone won\'t cost you months of progress.') + '</p><span class="small muted">' + (d == null ? 'No backup saved yet.' : 'Last backup: ' + d + ' days ago') + '</span></div><button class="btn outline" data-act="export">Back up now</button></section>';
+      return '<section class="card flat stack"><div class="stack-s"><span class="eyebrow">Backup</span><p class="small">' + (ui.storage === 'db' ? 'Your training is saved to your Claude account. A backup file is a second copy you control.' : ui.storage === 'cloud' ? 'Your training is saved to your account. A backup file is a second copy you control.' : 'Your training history lives only on this device. A backup file means a lost or reset phone won\'t cost you months of progress.') + '</p><span class="small muted">' + (d == null ? 'No backup saved yet.' : 'Last backup: ' + d + ' days ago') + '</span></div><button class="btn outline" data-act="export">Back up now</button></section>';
     }
     return '';
   }
@@ -7590,7 +7660,8 @@ three/build/three.module.js:
       '<button class="btn outline small" data-act="guide-open" style="align-self:flex-start">Open the first-day guide</button></section>';
     h += '<section class="stack"><div class="section-title"><h2>Skills you\'ve learned</h2></div><p class="small muted">Ballistic and overhead lifts only appear once their skill is on. Your experience already unlocks some; switch on the rest when you can do 10 clean reps without thinking about it.</p><div class="card" style="padding-block:4px">' +
       SKILLS.map(([k, l, d]) => { const isAuto = auto.includes(k); return '<button class="switch" role="switch" aria-checked="' + learned.includes(k) + '" data-act="skill" data-v="' + k + '"' + (isAuto ? ' disabled' : '') + '><span class="grow"><b style="font-weight:650">' + esc(l) + '</b><br><span class="small muted">' + esc(isAuto ? 'Unlocked by your experience. ' + d : d) + '</span></span><span class="knob"></span></button>'; }).join('') + '</div></section>';
-    h += '<section class="stack"><div class="section-title"><h2>Your data</h2></div><p class="small muted">' + (s.lastBackupDay >= 0 ? 'Last backup: ' + (today() - s.lastBackupDay) + ' days ago. ' : 'No backup saved yet. ') + (ui.storage === 'db' ? 'Saved to your Claude account, private to you, and available on any device where you open this app signed in.' : 'Saved on this device only. Export a backup now and then to keep it safe or move it to another phone.') + '</p>' +
+    if (ui.storage !== 'db') h += '<section class="stack"><div class="section-title"><h2>Account</h2></div>' + (ui.storage === 'cloud' && Cloud.sess ? '<p class="small muted">Signed in as <b>' + esc(Cloud.sess.user.email) + '</b>. Your sessions and progress sync across your devices.</p>' : '<p class="small muted">Optional. Sign in with your email to keep your sessions and progress in your own account and open them on any phone. No password: we email you a code.</p>') + '<button class="btn outline small" data-act="acct-open" style="align-self:flex-start">' + (ui.storage === 'cloud' ? 'Manage account' : 'Sign in or create account') + '</button></section>';
+    h += '<section class="stack"><div class="section-title"><h2>Your data</h2></div><p class="small muted">' + (s.lastBackupDay >= 0 ? 'Last backup: ' + (today() - s.lastBackupDay) + ' days ago. ' : 'No backup saved yet. ') + (ui.storage === 'db' ? 'Saved to your Claude account, private to you, and available on any device where you open this app signed in.' : ui.storage === 'cloud' ? 'Saved on this device and to your Kettlewise account.' : 'Saved on this device only. Export a backup now and then to keep it safe or move it to another phone.') + '</p>' +
       '<div class="row wrap"><button class="btn outline small" data-act="export">Export backup</button><button class="btn outline small" data-act="export-csv">Export CSV</button><label class="btn outline small" for="import-file">Import backup</label><input id="import-file" type="file" accept="application/json,.json" hidden></div>' +
       '<button class="btn danger small" data-act="reset" style="align-self:flex-start">Delete everything</button></section>';
     h += '<section class="stack-s small muted"><p>Kettlewise gives general fitness guidance, not medical advice. Check with a doctor before starting a new exercise programme, especially if you have a health condition. Stop any exercise that causes pain.</p></section></main>';
@@ -7712,6 +7783,7 @@ three/build/three.module.js:
     else if (s.type === 'test') inner = sheetTest(s);
     else if (s.type === 'assess') inner = sheetAssess(s);
     else if (s.type === 'pain') inner = sheetPain(s);
+    else if (s.type === 'account') inner = sheetAccount();
     el.innerHTML = '<div class="scrim" data-act="sheet-close"></div><div class="sheet" role="dialog" aria-modal="true"><div class="grabber"></div><div class="sheet-in">' + inner + '</div></div>';
     afterSheet();
   }
@@ -7796,6 +7868,26 @@ three/build/three.module.js:
   function sheetAssess(s) {
     return sheetTop('Where are you with these lifts?', 'Skill School') + '<p class="muted">Be honest: this decides where your skill tracks start. Confident means 10 clean reps without having to think about it. Confident is a test-out, not a pass: one session that meets the bar passes the track.</p>' + assessList(s.levels, 'assess-set') +
       '<button class="btn primary big" data-act="assess-save">Save</button>';
+  }
+  function sheetAccount() {
+    const a = ui.acct || (ui.acct = { stage: 'email', email: '', err: null, busy: false });
+    if (ui.storage === 'cloud' && Cloud.sess) {
+      return sheetTop('Your account', 'Account') + '<p>Signed in as <b>' + esc(Cloud.sess.user.email) + '</b>.</p><p class="small muted">Your sessions, progress and settings are saved to your account and to this device, and appear on any phone where you sign in with this email.</p>' +
+        (a.err ? '<div class="card tint-warm small">' + esc(a.err) + '</div>' : '') +
+        '<button class="btn primary big" data-act="acct-sync"' + (a.busy ? ' disabled' : '') + '>' + (a.busy ? 'Syncing…' : 'Sync now') + '</button><button class="btn outline full" data-act="acct-out">Sign out</button>' +
+        '<div class="divider"></div><p class="small muted">Deleting your account removes your email and everything stored in the cloud. The copy on this device stays.</p><button class="btn danger small" data-act="acct-delete" style="align-self:flex-start">Delete account and cloud data</button>';
+    }
+    let h = sheetTop(a.stage === 'code' ? 'Enter your code' : 'Sign in', 'Account');
+    if (a.err) h += '<div class="card tint-warm small">' + esc(a.err) + '</div>';
+    if (a.stage === 'code') {
+      h += '<p class="muted">We emailed a code to <b>' + esc(a.email) + '</b>. It expires in an hour.</p><div class="field"><label for="acct-code">Code</label><input class="input num" id="acct-code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="Code from the email"></div>' +
+        '<button class="btn primary big" data-act="acct-verify"' + (a.busy ? ' disabled' : '') + '>' + (a.busy ? 'Checking…' : 'Sign in') + '</button><button class="btn ghost full" data-act="acct-back">Use a different email</button>';
+    } else {
+      h += '<p class="muted">Enter your email. We send a one-time code, so there is no password to remember. New here? The same step creates your account.</p><div class="field"><label for="acct-email">Email</label><input class="input" id="acct-email" type="email" inputmode="email" autocomplete="email" autocapitalize="none" value="' + esc(a.email) + '" placeholder="you@example.com"></div>' +
+        '<button class="btn primary big" data-act="acct-send"' + (a.busy ? ' disabled' : '') + '>' + (a.busy ? 'Sending…' : 'Email me a code') + '</button>' +
+        '<p class="tiny faint">We store your email and your training data (sessions, body measurements, pain reports) only to sync it to you. Nobody else can read it. You can delete it all at any time here.</p>';
+    }
+    return h;
   }
   function sheetPain(s) {
     return sheetTop('Where does it hurt?', 'This hurts') + '<p class="muted">This exercise stops now. Anything left today that loads the same area is swapped for an alternative that avoids it.</p><div class="stack-s">' +
@@ -8081,6 +8173,41 @@ three/build/three.module.js:
       case 'opt-int': planOpt.intensity = v === 'AUTO' ? null : v; render(); break;
       case 'rebuild': generate({ minutes: planOpt.minutes || S.plan.minutes, focus: planOpt.focus, intensity: planOpt.intensity }); render(); toast('New session built.'); break;
       case 'shuffle': generate({ minutes: planOpt.minutes || S.plan.minutes, focus: planOpt.focus, intensity: planOpt.intensity, shuffle: true }); render(); toast('Different moves, same plan.'); break;
+      // account
+      case 'acct-open': ui.acct = { stage: 'email', email: '', err: null, busy: false }; ui.sheet = { type: 'account' }; renderSheet(); break;
+      case 'acct-back': ui.acct.stage = 'email'; ui.acct.err = null; renderSheet(); break;
+      case 'acct-send': {
+        const em = (($('#acct-email') || {}).value || '').trim().toLowerCase(); const A = ui.acct; A.email = em;
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) { A.err = 'Enter a valid email address.'; renderSheet(); break; }
+        A.busy = true; A.err = null; renderSheet();
+        Cloud.sendCode(em).then(() => { A.busy = false; A.stage = 'code'; renderSheet(); }).catch((e) => { A.busy = false; A.err = e.message || 'Could not send the code.'; renderSheet(); });
+        break;
+      }
+      case 'acct-verify': {
+        const code = (($('#acct-code') || {}).value || '').replace(/\s+/g, ''); const A = ui.acct;
+        if (!/^\d{6,10}$/.test(code)) { A.err = 'Enter the code from the email (digits only).'; renderSheet(); break; }
+        A.busy = true; A.err = null; renderSheet();
+        Cloud.verify(A.email, code).then(async () => {
+          Store.db = Cloud.db(); Store.uid = Cloud.sess.user.id; Store.base = 'data/users/' + Store.uid; ui.storage = 'cloud';
+          try {
+            const remote = await Store.load();
+            S = normalize(mergeStates(S && S.onboarded ? normalize(S) : null, remote ? normalize(remote) : null) || S);
+            ensurePlan(); await Store.replaceAll();
+          } catch (e) { ui.storageNote = 'Signed in, but the first sync did not finish. It will retry when you next save.'; }
+          A.busy = false; A.err = null; ui.sheet = null; renderSheet(); render(); toast('Signed in. Your training is synced.');
+        }).catch((e) => { A.busy = false; A.err = e.message || 'Sign-in failed.'; renderSheet(); });
+        break;
+      }
+      case 'acct-sync': {
+        const A = ui.acct; A.busy = true; A.err = null; renderSheet();
+        (async () => { try { const remote = await Store.load(); S = normalize(mergeStates(normalize(S), remote ? normalize(remote) : null)); ensurePlan(); await Store.replaceAll(); ui.storageNote = null; toast('Synced.'); } catch (e) { A.err = e && e.code === 'revoked' ? 'You were signed out. Sign in again.' : 'Could not reach your account. Your training is safe on this device.'; } A.busy = false; renderSheet(); render(); })();
+        break;
+      }
+      case 'acct-out': confirmDialog('Sign out?', 'Your training stays on this device. Sign in again to resume syncing.', 'Sign out', async () => { await Cloud.signOut(); Store.db = null; ui.storage = 'local'; ui.sheet = null; renderSheet(); render(); toast('Signed out.'); }); break;
+      case 'acct-delete': confirmDialog('Delete your account?', 'This removes your email and all training stored in the cloud, and cannot be undone. The copy on this device stays.', 'Delete account', async () => {
+        try { await Cloud.rest('/rpc/delete_my_account', { method: 'POST', body: {} }); await Cloud.signOut(); Store.db = null; ui.storage = 'local'; ui.sheet = null; renderSheet(); render(); toast('Account deleted.'); }
+        catch (e) { ui.acct.err = 'Could not delete the account right now. Try again, or contact support.'; renderSheet(); }
+      }, true); break;
       // coach, guide, review, soreness
       case 'today-more': S.settings.todayFull = true; Store.save('core'); render(); break;
       case 'today-less': S.settings.todayFull = false; Store.save('core'); render(); break;
@@ -8259,12 +8386,14 @@ three/build/three.module.js:
     loadClips();
     const ok = await Store.connect();
     if (ok) {
-      ui.storage = 'db';
+      ui.storage = ok === 'cloud' ? 'cloud' : 'db';
       try {
         const remote = await Promise.race([Store.load(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000))]);
-        if (remote) S = normalize(remote);
+        if (ok === 'cloud') { S = normalize(mergeStates(local && local.onboarded ? normalize(local) : null, remote ? normalize(remote) : null) || S); if (S.onboarded) Store.replaceAll(); }
+        else if (remote) S = normalize(remote);
         else if (local && local.onboarded) { Store.replaceAll(); }
-      } catch (e) { ui.storageNote = local ? 'Can\'t reach your saved training right now; showing the copy on this device.' : 'Can\'t reach your saved training right now.'; }
+      } catch (e) {
+        if (e && e.code === 'revoked') { Store.db = null; ui.storage = 'local'; ui.storageNote = 'You were signed out. Your training is still on this device; sign in again from Settings to keep syncing.'; } else ui.storageNote = local ? 'Can\'t reach your saved training right now; showing the copy on this device.' : 'Can\'t reach your saved training right now.'; }
     }
     ui.loading = false;
     ensurePlan();
